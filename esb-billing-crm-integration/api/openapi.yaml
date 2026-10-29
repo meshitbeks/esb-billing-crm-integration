@@ -1,0 +1,357 @@
+openapi: 3.0.3
+info:
+  title: ESB Tariff Service API
+  version: 1.0.0
+  description: |
+    Сервис ESB для смены тарифного плана абонента.
+    Потребитель — CRM. ESB вызывает биллинг (SOAP) и публикует событие `tariff.changed` в Kafka.
+
+    **Идемпотентность:** POST-запросы обязаны содержать заголовок `X-Request-Id` (UUID).
+    Повтор запроса с тем же `X-Request-Id` в течение 24 часов возвращает сохранённый результат
+    и не вызывает биллинг повторно.
+  contact:
+    name: Сагыныш Мешитбек
+    email: meshitbek.s@gmail.com
+
+servers:
+  - url: https://esb.example.kz/api/v1
+    description: Пример (вымышленный адрес)
+
+tags:
+  - name: Tariffs
+    description: Тарифы и их смена
+
+security:
+  - bearerAuth: []
+
+paths:
+  /subscribers/{msisdn}/available-tariffs:
+    get:
+      tags: [Tariffs]
+      summary: Получить тарифы, доступные абоненту
+      description: Возвращает тарифы с учётом региона, типа оплаты и статуса абонента. Текущий тариф в список не входит.
+      operationId: getAvailableTariffs
+      parameters:
+        - $ref: '#/components/parameters/Msisdn'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Список доступных тарифов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableTariffsResponse'
+              example:
+                msisdn: '77071234567'
+                currentTariffCode: 'SMART_5'
+                tariffs:
+                  - code: 'SMART_10'
+                    name: 'Smart 10'
+                    monthlyFee: 4990
+                    currency: 'KZT'
+                  - code: 'UNLIM_PLUS'
+                    name: 'Безлимит+'
+                    monthlyFee: 7990
+                    currency: 'KZT'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SubscriberNotFound'
+        '503':
+          $ref: '#/components/responses/BillingUnavailable'
+
+  /subscribers/{msisdn}/tariff-changes:
+    post:
+      tags: [Tariffs]
+      summary: Сменить тарифный план абонента
+      operationId: changeTariff
+      parameters:
+        - $ref: '#/components/parameters/Msisdn'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TariffChangeRequest'
+            example:
+              newTariffCode: 'SMART_10'
+              effectiveMode: 'IMMEDIATE'
+              channel: 'CRM'
+              operatorId: 'op-10452'
+      responses:
+        '201':
+          description: Тариф изменён (или запланирован на 1-е число)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TariffChangeResponse'
+              example:
+                changeId: '5b1f0a2c-8d7e-4c1a-9f3e-2a6b7c8d9e01'
+                msisdn: '77071234567'
+                oldTariffCode: 'SMART_5'
+                newTariffCode: 'SMART_10'
+                status: 'APPLIED'
+                effectiveDate: '2026-10-29'
+                billingOperationId: 'BL-998877'
+        '200':
+          description: Повторный запрос с тем же X-Request-Id — возвращён ранее сохранённый результат
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TariffChangeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SubscriberNotFound'
+        '409':
+          description: Для абонента уже выполняется смена тарифа
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: 'CHANGE_IN_PROGRESS'
+                message: 'Для абонента уже выполняется смена тарифа'
+                correlationId: '0f9c1d2e-3b4a-4c5d-8e6f-7a8b9c0d1e2f'
+        '422':
+          description: Бизнес-ошибка, смена тарифа невозможна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                insufficientFunds:
+                  summary: Недостаточно средств
+                  value:
+                    code: 'INSUFFICIENT_FUNDS'
+                    message: 'Недостаточно средств для подключения тарифа'
+                    details:
+                      requiredAmount: 4990
+                      balance: 1200
+                    correlationId: '0f9c1d2e-3b4a-4c5d-8e6f-7a8b9c0d1e2f'
+                tariffNotAvailable:
+                  summary: Тариф недоступен абоненту
+                  value:
+                    code: 'TARIFF_NOT_AVAILABLE'
+                    message: 'Тариф недоступен для абонента'
+                    correlationId: '0f9c1d2e-3b4a-4c5d-8e6f-7a8b9c0d1e2f'
+        '503':
+          $ref: '#/components/responses/BillingUnavailable'
+
+    get:
+      tags: [Tariffs]
+      summary: История смен тарифа абонента
+      operationId: getTariffChanges
+      parameters:
+        - $ref: '#/components/parameters/Msisdn'
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: limit
+          in: query
+          required: false
+          description: Количество записей (по умолчанию 20)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: История смен, новые сверху
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TariffChangeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SubscriberNotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Msisdn:
+      name: msisdn
+      in: path
+      required: true
+      description: Номер абонента в формате 7XXXXXXXXXX
+      schema:
+        type: string
+        pattern: '^7\d{10}$'
+      example: '77071234567'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      description: Ключ идемпотентности (UUID), генерирует CRM на каждое действие оператора
+      schema:
+        type: string
+        format: uuid
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Сквозной идентификатор для поиска запроса в логах всех систем
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Tariff:
+      type: object
+      required: [code, name, monthlyFee, currency]
+      properties:
+        code:
+          type: string
+          description: Код тарифа в биллинге
+          example: 'SMART_10'
+        name:
+          type: string
+          example: 'Smart 10'
+        monthlyFee:
+          type: number
+          format: decimal
+          minimum: 0
+          description: Абонентская плата в месяц
+          example: 4990
+        currency:
+          type: string
+          enum: [KZT]
+
+    AvailableTariffsResponse:
+      type: object
+      required: [msisdn, currentTariffCode, tariffs]
+      properties:
+        msisdn:
+          type: string
+        currentTariffCode:
+          type: string
+        tariffs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tariff'
+
+    TariffChangeRequest:
+      type: object
+      required: [newTariffCode, effectiveMode, channel, operatorId]
+      properties:
+        newTariffCode:
+          type: string
+          description: Код нового тарифа из списка доступных
+        effectiveMode:
+          type: string
+          enum: [IMMEDIATE, NEXT_MONTH]
+          description: IMMEDIATE — сразу, NEXT_MONTH — с 1-го числа следующего месяца
+        channel:
+          type: string
+          enum: [CRM, MOBILE_APP]
+          description: Канал, из которого пришёл запрос
+        operatorId:
+          type: string
+          description: Идентификатор оператора CRM (для аудита)
+        comment:
+          type: string
+          maxLength: 500
+
+    TariffChangeResponse:
+      type: object
+      required: [changeId, msisdn, oldTariffCode, newTariffCode, status, effectiveDate]
+      properties:
+        changeId:
+          type: string
+          format: uuid
+        msisdn:
+          type: string
+        oldTariffCode:
+          type: string
+        newTariffCode:
+          type: string
+        status:
+          type: string
+          enum: [APPLIED, SCHEDULED]
+          description: APPLIED — применён, SCHEDULED — запланирован на дату effectiveDate
+        effectiveDate:
+          type: string
+          format: date
+        billingOperationId:
+          type: string
+          description: Идентификатор операции в биллинге
+        createdAt:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - SUBSCRIBER_NOT_FOUND
+            - CHANGE_IN_PROGRESS
+            - INSUFFICIENT_FUNDS
+            - TARIFF_NOT_AVAILABLE
+            - BILLING_UNAVAILABLE
+        message:
+          type: string
+          description: Текст для показа оператору
+        details:
+          type: object
+          additionalProperties: true
+        correlationId:
+          type: string
+          format: uuid
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос (формат номера, обязательные поля)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: 'VALIDATION_ERROR'
+            message: 'Поле newTariffCode обязательно'
+    Unauthorized:
+      description: Нет или неверный токен
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    SubscriberNotFound:
+      description: Абонент не найден или не активен
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: 'SUBSCRIBER_NOT_FOUND'
+            message: 'Абонент не найден или не активен'
+    BillingUnavailable:
+      description: Биллинг не ответил за 10 секунд или недоступен. Повтор с тем же X-Request-Id безопасен.
+      headers:
+        Retry-After:
+          description: Через сколько секунд повторить
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: 'BILLING_UNAVAILABLE'
+            message: 'Сервис временно недоступен, повторите позже'
